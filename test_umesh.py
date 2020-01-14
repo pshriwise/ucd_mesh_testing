@@ -1,6 +1,8 @@
 import sys
 from termcolor import cprint
 from subprocess import CalledProcessError
+from argparse import ArgumentParser
+from itertools import product
 
 import numpy as np
 import openmc
@@ -204,6 +206,19 @@ def quad_to_tris(mb, q):
 
     mb.tag_set_data(quad_tri_handle, q, [tri1, tri2])
 
+def create_plots():
+
+    plot = openmc.Plot()
+    plot.origin = (0.0, 0.0, 0.0)
+    plot.width = (20, 20)
+    plot.height = (200, 200)
+    plot.color_by = 'material'
+
+    plots = openmc.Plots()
+    plots.append(plot)
+
+    plots.export_to_xml()
+
 def create_settings(batches, particles):
     """
     Create settings.xml file
@@ -313,13 +328,34 @@ def compare_results(statepoint, holes=()):
             flt = tally.find_filter(openmc.MeshFilter)
 
             if isinstance(flt.mesh, openmc.UnstructuredMesh):
-                ucd_data = report_unstructured_mesh(tally)
+                ucd_data, ucd_err = report_unstructured_mesh(tally)
             else:
-                reg_data = report_structured_mesh(tally, holes)
+                reg_data, reg_err = report_structured_mesh(tally, holes)
 
-    decimals = 6
-    np.testing.assert_array_almost_equal(ucd_data, reg_data, decimals)
-    print("Results equal to within {} decimal places.\n".format(decimals))
+    # display particles/sec
+    particles = sp.n_particles * sp.n_batches # n particles
+    runtime = sp.runtime['simulation']
+    particles_per_second = particles / runtime
+    print("Particles/sec: {}".format(particles_per_second))
+
+    # display FOM for the unstructured mesh
+    rel_err = np.nan_to_num(ucd_err / ucd_data, nan=0.0)
+    rel_err_sum = np.sum(rel_err)
+    fom_time = 1.0 / (runtime * rel_err_sum ** 2)
+    fom_particle = 1.0 / (particles * rel_err_sum ** 2)
+
+    print("FOM (time): {}".format(fom_time))
+    print("FOM (particles): {}".format(fom_particle))
+
+    decimals = 5
+    try:
+        np.testing.assert_array_almost_equal(ucd_data, reg_data, decimals)
+        cprint("PASS", 'green')
+        print("Results equal to within {} decimal places.\n".format(decimals))
+    except AssertionError as ae:
+        cprint("FAIL", 'red')
+        print(ae)
+        print()
 
 def report_structured_mesh(tally, holes=(), verbose=0):
     # get the tally results
@@ -344,7 +380,8 @@ def report_structured_mesh(tally, holes=(), verbose=0):
         print()
 
     data = data.reshape(data.size, 1)
-    return np.sum(data, axis=1)
+    err = err.reshape(err.size, 1)
+    return np.sum(data, axis=1), np.sum(err, axis=1)
 
 def report_unstructured_mesh(tally, verbose=0):
 
@@ -368,7 +405,7 @@ def report_unstructured_mesh(tally, verbose=0):
                                                       np.sqrt(np.sum(e**2))))
         print()
 
-    return np.sum(data, axis=1)
+    return np.sum(data, axis=1), np.sum(err, axis=1)
 
 def perform_comparison(mesh_dims=(3,3,3),
                        with_holes=False,
@@ -376,15 +413,17 @@ def perform_comparison(mesh_dims=(3,3,3),
                        mesh_lib='moab',
                        skip_run=False,
                        external_geom=False,
-                       verbose=0):
+                       verbose=0,
+                       particles=50000,
+                       n_threads=15):
 
     print("Test Summary:")
     print("Mesh Dimensions: {}".format(mesh_dims))
     print("Estimator: {}".format(estimator))
     print("External Geometry: {}".format(external_geom))
+    print("With Holes: {}".format(with_holes))
     print("Mesh Library: {}".format(mesh_lib))
-
-    mesh_dims = (3, 3, 3)
+    print("Particles per Batch: {}".format(particles))
 
     if with_holes:
         holes_ijk = ((1,1,1),)
@@ -396,17 +435,17 @@ def perform_comparison(mesh_dims=(3,3,3),
     create_unstructured_mesh(mesh_dims, holes)
 
     create_model(mesh_dims, estimator, external_geom, mesh_library=mesh_lib)
-    batches = 10
-    particles = 100
+    batches = 50
     create_settings(batches, particles)
+    create_plots()
 
     # run openmc if needed
     if not skip_run:
         try:
-            openmc.run(output=verbose)
+            openmc.run(threads=n_threads, output=verbose)
         except CalledProcessError:
             cprint("Error running OpenMC. Rerunning with output.", 'red')
-            openmc.run()
+            openmc.run(threads=n_threads)
 
     statepoint_filename = "statepoint.{}.h5".format(batches)
 
@@ -414,47 +453,53 @@ def perform_comparison(mesh_dims=(3,3,3),
     compare_results(statepoint_filename, holes)
 
 if __name__ == "__main__":
-    skip_run = len(sys.argv) >= 2 and "-n" in sys.argv
-    verbose = len(sys.argv) >= 2 and "-v" in sys.argv
-
-    mesh_dims = (3, 3, 3)
 
     estimators = ('collision', 'tracklength')
-
     mesh_libs = ('moab', 'libmesh')
 
-    # perform comparisions using the mesh
+    ap = ArgumentParser(description="A Python program for testing OpenMC" \
+                        " unstructured mesh capability.")
 
-    for lib in mesh_libs:
+    ap.add_argument('-n', dest='skip_run', type=bool, default=False,
+                    help="Do not run OpenMC if present")
+    ap.add_argument('-v', dest='verbose', type=bool, default=False,
+                    help="Enable verbose output from OpenMC runs if present")
+    ap.add_argument('-e', dest='estimators', nargs='+', default=estimators,
+                    help="Specify estimators to test (collision/tracklength)")
+    ap.add_argument('-l', dest='libraries', nargs='+', default=mesh_libs,
+                    help="Specify mesh libraries to test")
+    ap.add_argument('-p', dest='particles', type=int, default=50000,
+                    help="Number of particles per batch")
+    ap.add_argument('-t', dest='threads', nargs='+', default=15,
+                    help="Number of threads to run OpenMC with")
+    mesh_dims = (10, 10, 10)
+
+    ext_geom = (False, True)
+    w_holes = (False, True)
+
+    args = ap.parse_args()
+
+    # perform comparisions using the mesh
+    for lib in args.libraries:
 
         print("======================")
         print("{} tests".format(lib))
         print("======================")
 
-        for estimator in estimators:
+        for estimator in args.estimators:
 
             print("-----------------")
             print("{} estimator".format(estimator))
             print("-----------------")
 
-            # no holes
-            perform_comparison(mesh_dims=mesh_dims,
-                               estimator=estimator,
-                               skip_run=skip_run,
-                               mesh_lib=lib,
-                               verbose=verbose)
-            # w holes
-            perform_comparison(mesh_dims=mesh_dims,
-                               estimator=estimator,
-                               with_holes=True,
-                               skip_run=skip_run,
-                               mesh_lib=lib,
-                               verbose=verbose)
-            # w holes and geometry external to the mesh
-            perform_comparison(mesh_dims=mesh_dims,
-                               estimator=estimator,
-                               with_holes=True,
-                               skip_run=skip_run,
-                               external_geom=True,
-                               mesh_lib=lib,
-                               verbose=verbose)
+            for ext, holes in product(ext_geom, w_holes):
+
+                perform_comparison(mesh_dims=mesh_dims,
+                                   estimator=estimator,
+                                   with_holes=holes,
+                                   skip_run=args.skip_run,
+                                   external_geom=ext,
+                                   mesh_lib=lib,
+                                   verbose=args.verbose,
+                                   particles=args.particles,
+                                   n_threads=args.threads)
