@@ -3,6 +3,7 @@ from termcolor import cprint
 from subprocess import CalledProcessError
 from argparse import ArgumentParser
 from itertools import product
+from functools import reduce
 
 import numpy as np
 import openmc
@@ -286,8 +287,8 @@ def create_unstructured_mesh(mesh_dims, holes=()):
     all_hexes = mb.get_entities_by_type(0, types.MBHEX)
     holy_hexes = [all_hexes[hole] for hole in holes]
     mb.delete_entities(holy_hexes)
-    all_hexes = mb.get_entities_by_type(0, types.MBHEX)
 
+    all_hexes = mb.get_entities_by_type(0, types.MBHEX)
     all_quads = mb.get_adjacencies(all_hexes, 2, create_if_missing=True, op_type=types.UNION)
 
     for quad in all_quads:
@@ -347,15 +348,23 @@ def compare_results(statepoint, holes=()):
     print("FOM (time): {}".format(fom_time))
     print("FOM (particles): {}".format(fom_particle))
 
-    decimals = 5
-    try:
-        np.testing.assert_array_almost_equal(ucd_data, reg_data, decimals)
+    # successively check how many decimals the results are equal to
+    decimals = 1
+    while True:
+        try:
+            np.testing.assert_array_almost_equal(ucd_data, reg_data, decimals)
+        except AssertionError as ae:
+            print(ae)
+            print()
+            break
+        # increment decimals
+        decimals += 1
+
+    print("Results equal to within {} decimal places.\n".format(decimals))
+    if decimals < 5:
+        cprint("FAIL - results not equal to within 5 decimals", 'red')
+    else:
         cprint("PASS", 'green')
-        print("Results equal to within {} decimal places.\n".format(decimals))
-    except AssertionError as ae:
-        cprint("FAIL", 'red')
-        print(ae)
-        print()
 
 def report_structured_mesh(tally, holes=(), verbose=0):
     # get the tally results
@@ -363,9 +372,8 @@ def report_structured_mesh(tally, holes=(), verbose=0):
     err = tally.get_reshaped_data(value='std_dev')
 
     if holes:
-        for hole in holes:
-            data = np.delete(data, hole)
-            err = np.delete(err, hole)
+        data = np.delete(data, holes)
+        err = np.delete(err, holes)
 
     if verbose:
         print()
@@ -407,7 +415,7 @@ def report_unstructured_mesh(tally, verbose=0):
 
     return np.sum(data, axis=1), np.sum(err, axis=1)
 
-def perform_comparison(mesh_dims=(3,3,3),
+def perform_comparison(mesh_dims=None,
                        with_holes=False,
                        estimator='tracklength',
                        mesh_lib='moab',
@@ -416,6 +424,11 @@ def perform_comparison(mesh_dims=(3,3,3),
                        verbose=0,
                        particles=50000,
                        n_threads=15):
+
+    if mesh_dims is None:
+        mesh_dims = (np.random.randint(2, 10),
+                     np.random.randint(2, 10),
+                     np.random.randint(2, 10))
 
     print("Test Summary:")
     print("Mesh Dimensions: {}".format(mesh_dims))
@@ -426,12 +439,17 @@ def perform_comparison(mesh_dims=(3,3,3),
     print("Particles per Batch: {}".format(particles))
 
     if with_holes:
-        holes_ijk = ((1,1,1),)
+        # randomly select some holes in the mesh
+        holes_ijk = []
+        for i in range(reduce(lambda x,y: x*y, mesh_dims) // 10):
+            holes_ijk.append((np.random.randint(0, mesh_dims[0] - 1),
+                              np.random.randint(0, mesh_dims[1] - 1),
+                              np.random.randint(0, mesh_dims[2] - 1)))
     else:
         holes_ijk = ()
 
     nx, ny, nz = mesh_dims
-    holes = tuple(i + j * nx + k * (nx * ny) for i, j, k in holes_ijk)
+    holes = tuple({i + j * nx + k * (nx * ny) for i, j, k in holes_ijk})
     create_unstructured_mesh(mesh_dims, holes)
 
     create_model(mesh_dims, estimator, external_geom, mesh_library=mesh_lib)
@@ -449,7 +467,6 @@ def perform_comparison(mesh_dims=(3,3,3),
 
     statepoint_filename = "statepoint.{}.h5".format(batches)
 
-    holes = tuple(k + j * nz + i * (nz * ny) for i, j, k in holes_ijk)
     compare_results(statepoint_filename, holes)
 
 if __name__ == "__main__":
@@ -472,7 +489,6 @@ if __name__ == "__main__":
                     help="Number of particles per batch")
     ap.add_argument('-t', dest='threads', nargs='+', default=15,
                     help="Number of threads to run OpenMC with")
-    mesh_dims = (10, 10, 10)
 
     ext_geom = (False, True)
     w_holes = (False, True)
@@ -494,8 +510,7 @@ if __name__ == "__main__":
 
             for ext, holes in product(ext_geom, w_holes):
 
-                perform_comparison(mesh_dims=mesh_dims,
-                                   estimator=estimator,
+                perform_comparison(estimator=estimator,
                                    with_holes=holes,
                                    skip_run=args.skip_run,
                                    external_geom=ext,
